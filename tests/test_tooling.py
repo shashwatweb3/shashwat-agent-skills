@@ -496,6 +496,56 @@ class StructureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("named exactly SKILL.md", result.stdout)
 
+    def test_mis_cased_skill_file_is_named_even_when_the_root_file_is_absent(self):
+        """On a case-sensitive filesystem the root file is simply missing.
+
+        The diagnostic still has to name the offending file, otherwise a
+        `skill.md` is indistinguishable from a skill with no file at all.
+        Checked directly so it holds on case-insensitive macOS too.
+        """
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+
+        loader = SourceFileLoader("validate_skills", VALIDATE)
+        spec = importlib.util.spec_from_file_location(
+            "validate_skills", VALIDATE, loader=loader
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = os.path.join(tmp, "example-skill")
+            os.makedirs(skill_dir)
+            with open(os.path.join(skill_dir, "skill.md"), "w", encoding="utf-8") as fh:
+                fh.write("# mis-cased\n")
+            problems = module._report_missing_skill_file(skill_dir, "skills/example-skill")
+            messages = " ".join(p.message for p in problems)
+            self.assertIn("named exactly SKILL.md", messages)
+            self.assertIn("'skill.md'", messages)
+
+    def test_a_truly_empty_skill_directory_says_so(self):
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+
+        loader = SourceFileLoader("validate_skills", VALIDATE)
+        spec = importlib.util.spec_from_file_location(
+            "validate_skills", VALIDATE, loader=loader
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = os.path.join(tmp, "example-skill")
+            os.makedirs(skill_dir)
+            with open(os.path.join(skill_dir, "notes.md"), "w", encoding="utf-8") as fh:
+                fh.write("no skill file here\n")
+            problems = module._report_missing_skill_file(skill_dir, "skills/example-skill")
+            messages = " ".join(p.message for p in problems)
+            self.assertIn("no SKILL.md found at the skill root", messages)
+            self.assertNotIn("named exactly", messages)
+
     def test_nested_second_skill_md_is_rejected(self):
         with TempRepo() as repo:
             repo.write("skills/example-skill/references/other/SKILL.md", "# nested\n")

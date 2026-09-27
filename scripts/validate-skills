@@ -29,21 +29,53 @@ TEXT_SUFFIXES = (".md", ".py", ".json", ".yml", ".yaml", ".sh")
 KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
+def _report_missing_skill_file(directory: str, where: str) -> list[lib.Problem]:
+    """Explain a missing root `SKILL.md`, and name a mis-cased file if there is one.
+
+    A `skill.md` is the single most common mistake, and on a case-sensitive
+    filesystem it is invisible to a plain "no SKILL.md found" message, so call
+    it out by name.
+    """
+    try:
+        listing = sorted(os.listdir(directory))
+    except OSError:
+        listing = []
+
+    for entry in listing:
+        if entry != SKILL_MD and entry.lower() == SKILL_MD.lower():
+            return [
+                lib.Problem(
+                    "error",
+                    os.path.join(where, entry),
+                    f"file must be named exactly {SKILL_MD}, not {entry!r}. "
+                    "Clients look for the exact spelling, and some filesystems "
+                    "treat the two as different files.",
+                ),
+                lib.Problem(
+                    "error",
+                    where,
+                    f"no {SKILL_MD} found at the skill root",
+                ),
+            ]
+
+    clue = ", ".join(listing[:8]) + ("..." if len(listing) > 8 else "")
+    return [
+        lib.Problem(
+            "error",
+            where,
+            f"no {SKILL_MD} found at the skill root (contains: {clue})",
+        )
+    ]
+
+
 def check_single_skill_file(directory: str, where: str, root: str) -> list[lib.Problem]:
     """Exactly one `SKILL.md`, spelled exactly `SKILL.md`, at the skill root."""
     problems: list[lib.Problem] = []
     root_file = os.path.join(directory, SKILL_MD)
 
     if not os.path.isfile(root_file):
-        listing = sorted(os.listdir(directory))
-        clue = ", ".join(listing[:8]) + ("..." if len(listing) > 8 else "")
-        return [
-            lib.Problem(
-                "error",
-                where,
-                f"no {SKILL_MD} found at the skill root (contains: {clue})",
-            )
-        ]
+        problems.extend(_report_missing_skill_file(directory, where))
+        return problems
 
     # The file must be spelled exactly `SKILL.md`, and it must be the only one:
     # a second copy nested in `references/`, `scripts/`, `assets/` or anywhere

@@ -89,15 +89,32 @@ check_tooling_tests() {
 }
 
 check_readme_agrees() {
-  local listed
+  # Done in Python, not sed: BSD and GNU sed disagree on this pattern, and this
+  # script has to behave identically on a macOS laptop and on a Linux runner.
+  local listed documented
   listed="$(./scripts/list-skills --json | "$PYTHON" -c '
 import json, sys
-for entry in json.load(sys.stdin):
-    print(entry["name"])
-' | sort)"
+print("\n".join(sorted(e["name"] for e in json.load(sys.stdin))))
+')"
 
-  local documented
-  documented="$(sed -n 's/.*\[\`\([a-z0-9][a-z0-9-]*\)\`\](skills\/\1\/SKILL\.md).*/\1/p' README.md | sort -u)"
+  documented="$("$PYTHON" - "$REPO_ROOT/README.md" "$REPO_ROOT/scripts" <<'PY'
+import re, sys
+
+sys.path.insert(0, sys.argv[2])
+import skilllib
+
+# The link shape `./scripts/list-skills --markdown` emits. Both halves must
+# agree, so a stale path is caught too.
+LINK = re.compile(r"\[`([a-z0-9][a-z0-9-]*)`\]\(skills/([a-z0-9][a-z0-9-]*)/SKILL\.md\)")
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    # Fenced blocks hold examples, not the real skill list.
+    prose = skilllib.strip_fenced_code(handle.read())
+
+names = {m.group(1) for m in LINK.finditer(prose) if m.group(1) == m.group(2)}
+print("\n".join(sorted(names)))
+PY
+)"
 
   if [ "$listed" != "$documented" ]; then
     echo "README.md and skills/ disagree." >&2
