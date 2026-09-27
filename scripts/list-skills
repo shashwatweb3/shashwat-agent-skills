@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""List the skills in this repository, derived from their `SKILL.md` files.
+
+Usage:
+    ./scripts/list-skills [--root PATH] [--json] [--markdown] [--details]
+
+There is no registry to keep in sync. Everything printed here is read from the
+`name` and `description` frontmatter of each `skills/<name>/SKILL.md`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import skilllib as lib  # noqa: E402
+
+SUMMARY_WIDTH = 72
+
+
+def wrap(text: str, width: int = SUMMARY_WIDTH, indent: str = "    ") -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+    lines: list[str] = []
+    current = indent
+    for word in words:
+        candidate = word if current == indent else f"{current} {word}"
+        if len(candidate) > width and current != indent:
+            lines.append(current)
+            current = indent + word
+        else:
+            current = candidate if current != indent else indent + word
+    lines.append(current)
+    return lines
+
+
+def collect(root: str) -> list[dict]:
+    skills, _ = lib.discover_skills(os.path.join(root, "skills"))
+    entries = []
+    for skill in skills:
+        entries.append(
+            {
+                "name": skill.name or skill.directory,
+                "description": (skill.description or "").strip(),
+                "directory": f"skills/{skill.directory}",
+                "path": f"skills/{skill.directory}/{lib.SKILL_FILENAME}",
+                "frontmatter_ok": not skill.problems,
+            }
+        )
+    return sorted(entries, key=lambda entry: entry["name"])
+
+
+def print_text(entries: list[dict], details: bool) -> None:
+    print("Available skills")
+    print()
+    if not entries:
+        print("  (none found under skills/)")
+        return
+    for entry in entries:
+        print(entry["name"])
+        if entry["description"]:
+            for line in wrap(entry["description"]):
+                print(line)
+        else:
+            print("    (no description found in frontmatter)")
+        if details:
+            print(f"    path: {entry['path']}")
+        print()
+
+
+def print_markdown(entries: list[dict]) -> None:
+    for entry in entries:
+        description = entry["description"].replace("\n", " ").strip()
+        print(f"- [`{entry['name']}`]({entry['path']}) - {description}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="List skills by reading skills/<name>/SKILL.md."
+    )
+    parser.add_argument("--root", default=None, help="repository root")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--markdown", action="store_true", help="emit a Markdown bullet list"
+    )
+    parser.add_argument(
+        "--details", action="store_true", help="also print each skill's path"
+    )
+    args = parser.parse_args(argv)
+
+    root = lib.repo_root(args.root)
+    entries = collect(root)
+
+    if args.json:
+        print(json.dumps(entries, indent=2, ensure_ascii=False))
+    elif args.markdown:
+        print_markdown(entries)
+    else:
+        print_text(entries, args.details)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

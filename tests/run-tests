@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+#
+# Run every repository check.
+#
+#   ./tests/run-tests
+#
+# 1. validate every skill in skills/
+# 2. check that every skill has behaviour test cases
+# 3. unit-test the validation and listing tooling
+# 4. check that the skill list and the README agree
+# 5. check that scripts are executable and free of shellcheck-style problems
+#
+# Exits non-zero on the first failing step.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PYTHON="${PYTHON:-python3}"
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+  echo "error: $PYTHON not found. Set PYTHON to a Python 3 interpreter." >&2
+  exit 1
+fi
+
+step=0
+failures=0
+
+run_step() {
+  step=$((step + 1))
+  printf '\n=== [%d/%d] %s ===\n' "$step" "$TOTAL_STEPS" "$1"
+  if "$@"; then
+    printf 'ok: %s\n' "$1"
+  else
+    printf 'FAILED: %s\n' "$1" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+TOTAL_STEPS=5
+
+# ---------------------------------------------------------------------------
+
+check_skills() {
+  ./scripts/validate-skills --strict
+}
+
+check_test_coverage() {
+  local status=0
+  local skills
+  skills="$(./scripts/list-skills --json | "$PYTHON" -c '
+import json, sys
+for entry in json.load(sys.stdin):
+    print(entry["name"])
+')"
+
+  if [ -z "$skills" ]; then
+    echo "error: ./scripts/list-skills returned no skills" >&2
+    return 1
+  fi
+
+  local name
+  for name in $skills; do
+    local dir="tests/$name"
+    if [ ! -d "$dir" ]; then
+      echo "missing test-case directory: $dir" >&2
+      status=1
+      continue
+    fi
+    for required in README.md positive-cases.md non-trigger-cases.md; do
+      if [ ! -s "$dir/$required" ]; then
+        echo "missing or empty: $dir/$required" >&2
+        status=1
+      fi
+    done
+    local cases
+    cases="$(grep -c '^## ' "$dir"/*.md 2>/dev/null | awk -F: '{total += $2} END {print total + 0}')"
+    if [ "$cases" -lt 5 ]; then
+      echo "only $cases case(s) documented for $name; add more" >&2
+      status=1
+    fi
+  done
+
+  return $status
+}
+
+check_tooling_tests() {
+  "$PYTHON" tests/test_tooling.py
+}
+
+check_readme_agrees() {
+  local listed
+  listed="$(./scripts/list-skills --json | "$PYTHON" -c '
+import json, sys
+for entry in json.load(sys.stdin):
+    print(entry["name"])
+' | sort)"
+
+  local documented
+  documented="$(sed -n 's/.*\[\`\([a-z0-9][a-z0-9-]*\)\`\](skills\/\1\/SKILL\.md).*/\1/p' README.md | sort -u)"
+
+  if [ "$listed" != "$documented" ]; then
+    echo "README.md and skills/ disagree." >&2
+    echo "  in skills/: ${listed:-none}" >&2
+    echo "  in README:   ${documented:-none}" >&2
+    echo "  Regenerate the Available skills section with:" >&2
+    echo "    ./scripts/list-skills --markdown" >&2
+    return 1
+  fi
+  echo "README.md lists every skill: $(echo "$listed" | tr '\n' ' ')"
+}
+
+check_scripts() {
+  local status=0
+  local script
+  for script in scripts/validate-skills scripts/list-skills tests/run-tests; do
+    if [ ! -x "$script" ]; then
+      echo "not executable: $script" >&2
+      status=1
+    fi
+    if ! head -1 "$script" | grep -q '^#!'; then
+      echo "missing shebang: $script" >&2
+      status=1
+    fi
+  done
+
+  # Every shell entry point must fail fast and use strict mode.
+  for script in scripts/validate-skills scripts/list-skills tests/run-tests; do
+    case "$script" in
+      *.sh | tests/run-tests)
+        if ! grep -q 'set -euo pipefail' "$script"; then
+          echo "missing 'set -euo pipefail': $script" >&2
+          status=1
+        fi
+        ;;
+    esac
+  done
+
+  return $status
+}
+
+# ---------------------------------------------------------------------------
+
+printf 'Running repository checks in %s\n' "$REPO_ROOT"
+
+run_step check_skills
+run_step check_test_coverage
+run_step check_tooling_tests
+run_step check_readme_agrees
+run_step check_scripts
+
+printf '\n'
+if [ "$failures" -ne 0 ]; then
+  printf '%d check(s) FAILED\n' "$failures" >&2
+  exit 1
+fi
+printf 'All %d checks passed.\n' "$TOTAL_STEPS"

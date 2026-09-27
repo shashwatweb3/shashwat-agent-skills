@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""Validate every skill in `skills/` against the Agent Skills specification.
+
+Usage:
+    ./scripts/validate-skills [--root PATH] [--quiet] [--strict]
+
+Exits non-zero when any error is found. With `--strict`, warnings also fail.
+
+The filesystem is the source of truth: skills are discovered by scanning
+`skills/`, so adding a skill never requires editing a registry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import skilllib as lib  # noqa: E402
+
+SKILL_MD = lib.SKILL_FILENAME
+TEXT_SUFFIXES = (".md", ".py", ".json", ".yml", ".yaml", ".sh")
+
+#: A manifest identifier must be kebab-case.
+KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def check_single_skill_file(directory: str, where: str, root: str) -> list[lib.Problem]:
+    """Exactly one `SKILL.md`, spelled exactly `SKILL.md`, at the skill root."""
+    problems: list[lib.Problem] = []
+    root_file = os.path.join(directory, SKILL_MD)
+
+    if not os.path.isfile(root_file):
+        listing = sorted(os.listdir(directory))
+        clue = ", ".join(listing[:8]) + ("..." if len(listing) > 8 else "")
+        return [
+            lib.Problem(
+                "error",
+                where,
+                f"no {SKILL_MD} found at the skill root (contains: {clue})",
+            )
+        ]
+
+    # The file must be spelled exactly `SKILL.md`, and it must be the only one:
+    # a second copy nested in `references/`, `scripts/`, `assets/` or anywhere
+    # else means two things are trying to be one skill.
+    root_real = os.path.realpath(root_file)
+    for dirpath, dirnames, filenames in os.walk(directory):
+        dirnames[:] = sorted(dirnames)
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            rel = lib.rel(path, root)
+            if name == SKILL_MD:
+                if os.path.realpath(path) != root_real:
+                    problems.append(
+                        lib.Problem(
+                            "error",
+                            rel,
+                            "a skill directory must contain exactly one "
+                            f"{SKILL_MD} at its root; move this into a supporting "
+                            "file or split it into a separate skill",
+                        )
+                    )
+            elif name.lower() == SKILL_MD.lower():
+                problems.append(
+                    lib.Problem(
+                        "error",
+                        rel,
+                        f"file must be named exactly {SKILL_MD}, not {name!r}",
+                    )
+                )
+    return problems
+
+
+def check_skill(skill: lib.Skill, root: str) -> list[lib.Problem]:
+    problems: list[lib.Problem] = []
+    directory_rel = f"skills/{skill.directory}"
+    problems.extend(check_single_skill_file(skill.path, directory_rel, root))
+
+    where = f"{directory_rel}/{SKILL_MD}"
+    text, error = lib.read_text_checked(os.path.join(skill.path, SKILL_MD))
+    if text is None:
+        problems.append(lib.Problem("error", where, str(error)))
+        return problems
+
+    problems.extend(skill.problems)
+    if not skill.data and skill.problems:
+        # Frontmatter was missing or unparseable; the field checks are moot.
+        return problems
+
+    problems.extend(lib.validate_frontmatter_fields(skill.data, where))
+
+    name = skill.name
+    if name and skill.directory != name:
+        problems.append(
+            lib.Problem(
+                "error",
+                where,
+                f"'name' is {name!r} but the directory is named "
+                f"{skill.directory!r}; the specification requires them to match",
+            )
+        )
+
+    line_count = len(text.splitlines())
+    if line_count > lib.MAX_SKILL_MD_LINES:
+        problems.append(
+            lib.Problem(
+                "warning",
+                where,
+                f"{line_count} lines; the specification recommends keeping "
+                f"{SKILL_MD} under {lib.MAX_SKILL_MD_LINES} and moving detail "
+                "into references/",
+            )
+        )
+
+    problems.extend(lib.find_issues(text, skill.path, where=where))
+    problems.extend(lib.find_local_absolute_paths(text, where))
+    return problems
+
+
+def check_uniqueness(skills: list[lib.Skill], root: str) -> list[lib.Problem]:
+    """Duplicate `name` values and directory names that collide when normalized."""
+    problems: list[lib.Problem] = []
+
+    by_name: dict[str, list[str]] = {}
+    for skill in skills:
+        if skill.name:
+            by_name.setdefault(skill.name, []).append(skill.directory)
+
+    for name, directories in sorted(by_name.items()):
+        if len(directories) > 1:
+            problems.append(
+                lib.Problem(
+                    "error",
+                    "skills",
+                    f"duplicate skill 'name' {name!r} in: "
+                    + ", ".join(f"skills/{d}" for d in sorted(directories)),
+                )
+            )
+
+    by_normalized: dict[str, list[str]] = {}
+    for skill in skills:
+        by_normalized.setdefault(
+            lib.normalize_name(skill.directory), []
+        ).append(skill.directory)
+
+    for normalized, directories in sorted(by_normalized.items()):
+        if len(directories) > 1:
+            problems.append(
+                lib.Problem(
+                    "error",
+                    "skills",
+                    "duplicate skill directories that differ only by case or "
+                    "separator: " + ", ".join(f"skills/{d}" for d in sorted(directories)),
+                )
+            )
+
+    return problems
+
+
+def check_supporting_dirs(skills: list[lib.Skill]) -> list[lib.Problem]:
+    """Supporting directories must not be empty; they are created on purpose."""
+    problems: list[lib.Problem] = []
+    for skill in skills:
+        for name in lib.SUPPORTING_DIRS:
+            path = os.path.join(skill.path, name)
+            if os.path.isdir(path) and not os.listdir(path):
+                problems.append(
+                    lib.Problem(
+                        "warning",
+                        f"skills/{skill.directory}/{name}",
+                        "directory is empty; remove it instead of shipping a "
+                        "placeholder",
+                    )
+                )
+    return problems
+
+
+def check_packaging_manifests(root: str) -> list[lib.Problem]:
+    """Packaging JSON must parse, and every path it names must exist.
+
+    Both manifests are optional. When present they are held to the same rule as
+    the rest of the repository: they may only point at the canonical
+    `skills/` directory, never at a copy of a skill.
+    """
+    problems: list[lib.Problem] = []
+    seen_names: dict[str, list[str]] = {}
+    manifests = {
+        ".claude-plugin/plugin.json": "Claude Code plugin manifest",
+        "plugin.json": "portable Agent Plugins manifest",
+        ".agents/plugins/marketplace.json": "Codex marketplace catalog",
+        ".claude-plugin/marketplace.json": "Claude Code marketplace catalog",
+    }
+    for relative, label in manifests.items():
+        path = os.path.join(root, relative)
+        if not os.path.isfile(path):
+            continue
+        where = relative
+        text, error = lib.read_text_checked(path)
+        if text is None:
+            problems.append(lib.Problem("error", where, f"UTF-8 check failed: {error}"))
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            problems.append(lib.Problem("error", where, f"{label} is not valid JSON: {exc}"))
+            continue
+
+        problems.extend(_check_manifest_identity(data, where, label))
+        problems.extend(_check_manifest_paths(root, data, where))
+        if isinstance(data, dict) and isinstance(data.get("name"), str):
+            seen_names.setdefault(data["name"], []).append(where)
+
+    # Every manifest must agree on the plugin name, or clients see two different
+    # plugins depending on which manifest they read.
+    if len(seen_names) > 1:
+        listed = ", ".join(
+            f"{name!r} in {', '.join(sorted(paths))}" for name, paths in sorted(seen_names.items())
+        )
+        problems.append(
+            lib.Problem(
+                "error",
+                "packaging manifests",
+                f"manifests disagree on the plugin name: {listed}. Every manifest "
+                "must use the same 'name'.",
+            )
+        )
+    return problems
+
+
+def _check_manifest_identity(
+    data: object, where: str, label: str
+) -> list[lib.Problem]:
+    """A manifest `name` must be kebab-case, with string metadata."""
+    if not isinstance(data, dict):
+        return [lib.Problem("error", where, f"{label} must be a JSON object")]
+
+    name = data.get("name")
+    if not isinstance(name, str) or not name:
+        return [lib.Problem("error", where, f"{label} needs a non-empty string 'name'")]
+
+    problems: list[lib.Problem] = []
+    if not KEBAB_RE.match(name):
+        problems.append(
+            lib.Problem(
+                "error",
+                where,
+                f"{label} name {name!r} must be kebab-case: lowercase letters, "
+                "digits, and single hyphens",
+            )
+        )
+    for field in ("description", "version", "license"):
+        if field in data and not isinstance(data[field], str):
+            problems.append(
+                lib.Problem(
+                    "error", where, f"{field!r} must be a string, got {type(data[field]).__name__}"
+                )
+            )
+    return problems
+
+
+def _check_manifest_paths(root: str, data: object, where: str) -> list[lib.Problem]:
+    """Every local path a manifest names must exist inside the repository."""
+    if not isinstance(data, dict):
+        return []
+
+    candidates: list[str] = []
+    plugins = data.get("plugins")
+    if isinstance(plugins, list):
+        for entry in plugins:
+            if not isinstance(entry, dict):
+                continue
+            source = entry.get("source")
+            if isinstance(source, str):
+                candidates.append(source)
+            elif isinstance(source, dict):
+                path = source.get("path")
+                if isinstance(path, str):
+                    candidates.append(path)
+    for key in ("skills", "commands", "agents", "hooks", "outputStyles"):
+        value = data.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, str))
+
+    problems: list[lib.Problem] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        cleaned = candidate.strip().rstrip("/")
+        if not cleaned or cleaned in ("", "."):
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        if ".." in cleaned.split("/"):
+            problems.append(
+                lib.Problem(
+                    "error", where, f"path {candidate!r} escapes the repository via '..'"
+                )
+            )
+            continue
+        if not os.path.exists(os.path.join(root, cleaned)):
+            problems.append(
+                lib.Problem("error", where, f"path {candidate!r} does not exist in this repository")
+            )
+            continue
+        # A manifest may point at the canonical directory, never at a copy.
+        inside_skills = cleaned == "skills" or cleaned.startswith("skills/")
+        if not inside_skills and os.path.isfile(os.path.join(root, cleaned, SKILL_MD)):
+            problems.append(
+                lib.Problem(
+                    "error",
+                    where,
+                    f"path {candidate!r} holds its own {SKILL_MD} outside skills/; "
+                    "skills must live once under skills/",
+                )
+            )
+    return problems
+
+
+def check_skills_are_canonical(root: str) -> list[lib.Problem]:
+    """`skills/` is the only place a `SKILL.md` may live.
+
+    This is the repository's central invariant. A copy of a skill under a
+    platform directory, a build folder, or a `dist/` output would let two
+    clients load different instructions for the same skill name, and the two
+    would drift. The one exception is the template, which is a starting point
+    rather than a loadable skill because it sits outside `skills/`.
+    """
+    problems: list[lib.Problem] = []
+    template = os.path.join("templates", "skill", SKILL_MD)
+    for path in lib.iter_files(root):
+        if os.path.basename(path) != SKILL_MD:
+            continue
+        relative = lib.rel(path, root)
+        parts = relative.split(os.sep)
+        if len(parts) >= 3 and parts[0] == "skills":
+            continue
+        if relative == template:
+            continue
+        problems.append(
+            lib.Problem(
+                "error",
+                relative,
+                f"a {SKILL_MD} may only live under skills/, because skills/ is the "
+                "single source of truth. Keep this skill in skills/<name>/ and let "
+                "clients read it from there. Only templates/skill/SKILL.md is exempt.",
+            )
+        )
+    return problems
+
+
+def check_template(root: str) -> list[lib.Problem]:
+    """The starter template must be valid SKILL.md, minus the name match."""
+    path = os.path.join(root, "templates", "skill", SKILL_MD)
+    where = f"templates/skill/{SKILL_MD}"
+    if not os.path.isfile(path):
+        return [lib.Problem("error", where, "the skill template is missing")]
+
+    text, error = lib.read_text_checked(path)
+    if text is None:
+        return [lib.Problem("error", where, str(error))]
+
+    yaml_text, _, split_error = lib.split_frontmatter(text)
+    if split_error:
+        return [lib.Problem("error", where, split_error)]
+    assert yaml_text is not None
+
+    data, errors = lib.parse_frontmatter(yaml_text)
+    problems = [lib.Problem("error", where, message) for message in errors]
+    problems.extend(lib.validate_frontmatter_fields(data, where))
+    return problems
+
+
+def check_repo_text_files(root: str) -> list[lib.Problem]:
+    """UTF-8 validity across every committed text file.
+
+    Extensionless files count: `scripts/validate-skills` and `tests/run-tests`
+    are text, and they are the files most likely to carry a bad byte.
+    """
+    problems: list[lib.Problem] = []
+    for path in lib.iter_files(root):
+        if os.path.splitext(path)[1] and not path.endswith(TEXT_SUFFIXES):
+            continue
+        text, error = lib.read_text_checked(path)
+        if text is None:
+            problems.append(
+                lib.Problem("error", lib.rel(path, root), f"UTF-8 check failed: {error}")
+            )
+    return problems
+
+
+def check_repo_markdown_links(root: str, already_checked: set[str]) -> list[lib.Problem]:
+    """Every relative link in every committed Markdown file must resolve."""
+    problems: list[lib.Problem] = []
+    for path in lib.iter_files(root):
+        if not path.endswith(".md"):
+            continue
+        real = os.path.realpath(path)
+        if real in already_checked:
+            continue
+        text, error = lib.read_text_checked(path)
+        if text is None:
+            continue
+        where = lib.rel(path, root)
+        # Links and paths inside fenced blocks are examples, not references.
+        prose = lib.strip_fenced_code(text)
+        problems.extend(lib.find_issues(prose, os.path.dirname(path), where=where, code_refs=False))
+        problems.extend(lib.find_local_absolute_paths(prose, where))
+    return problems
+
+
+def collect(root: str) -> list[lib.Problem]:
+    problems: list[lib.Problem] = []
+    skills_dir = os.path.join(root, "skills")
+
+    if not os.path.isdir(skills_dir):
+        return [lib.Problem("error", "skills", "the `skills/` directory is missing")]
+
+    skills, discovery_problems = lib.discover_skills(skills_dir)
+    problems.extend(discovery_problems)
+
+    checked: set[str] = set()
+    for skill in skills:
+        problems.extend(check_skill(skill, root))
+        checked.add(os.path.realpath(os.path.join(skill.path, SKILL_MD)))
+
+    problems.extend(check_uniqueness(skills, root))
+    problems.extend(check_supporting_dirs(skills))
+    problems.extend(check_skills_are_canonical(root))
+    problems.extend(check_template(root))
+    problems.extend(check_packaging_manifests(root))
+    problems.extend(check_repo_text_files(root))
+    problems.extend(check_repo_markdown_links(root, checked))
+
+    if not skills:
+        problems.append(
+            lib.Problem(
+                "warning",
+                "skills",
+                "no skills found; this repository should always contain at "
+                "least one",
+            )
+        )
+    return problems
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate skills/ against the Agent Skills specification."
+    )
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="repository root (default: auto-detected from this script)",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="only print the summary line"
+    )
+    parser.add_argument(
+        "--strict", action="store_true", help="treat warnings as errors"
+    )
+    args = parser.parse_args(argv)
+
+    root = lib.repo_root(args.root)
+    problems = collect(root)
+
+    if args.quiet:
+        errors = sum(1 for p in problems if p.level == "error")
+        warnings = sum(1 for p in problems if p.level == "warning")
+        if errors:
+            print(f"FAILED: {errors} error(s), {warnings} warning(s)")
+            return 1
+        if args.strict and warnings:
+            print(f"FAILED (strict): 0 errors, {warnings} warning(s)")
+            return 1
+        print(f"PASSED: 0 errors, {warnings} warning(s)")
+        return 0
+
+    print(f"Validating skills in {lib.rel(os.path.join(root, 'skills'), root)}/")
+    if problems:
+        for problem in problems:
+            print(str(problem))
+        print("")
+
+    errors = sum(1 for p in problems if p.level == "error")
+    warnings = sum(1 for p in problems if p.level == "warning")
+
+    if errors:
+        print(f"FAILED: {errors} error(s), {warnings} warning(s)")
+        return 1
+    if args.strict and warnings:
+        print(f"FAILED (strict): 0 errors, {warnings} warning(s)")
+        return 1
+    print(f"PASSED: 0 errors, {warnings} warning(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

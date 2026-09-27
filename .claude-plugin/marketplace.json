@@ -1,0 +1,17 @@
+{
+  "name": "shashwat-agent-skills",
+  "owner": {
+    "name": "shashwatweb3",
+    "url": "https://github.com/shashwatweb3"
+  },
+  "metadata": {
+    "description": "Portable agent skills. One canonical SKILL.md per skill, usable from Claude Code, Codex, and OpenCode."
+  },
+  "plugins": [
+    {
+      "name": "shashwat-agent-skills",
+      "source": "./",
+      "description": "Website launch safety audits, plus more skills as they are added. Add this marketplace once and install from it with: claude plugin install shashwat-agent-skills@shashwat-agent-skills"
+    }
+  ]
+}

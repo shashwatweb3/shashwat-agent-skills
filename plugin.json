@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "shashwat-agent-skills",
+  "version": "0.1.0",
+  "description": "Portable agent skills: website launch safety audits and more. One canonical SKILL.md per skill, usable from Codex, Claude Code, and OpenCode.",
+  "author": {
+    "name": "Shashwat Chauhan",
+    "url": "https://github.com/shashwatweb3"
+  },
+  "homepage": "https://github.com/shashwatweb3/shashwat-agent-skills",
+  "repository": "https://github.com/shashwatweb3/shashwat-agent-skills",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "agent-skills",
+    "codex",
+    "opencode",
+    "audit",
+    "review"
+  ]
+}

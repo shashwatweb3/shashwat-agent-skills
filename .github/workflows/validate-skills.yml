@@ -1,0 +1,52 @@
+name: Validate skills
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-skills-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The tooling is standard library only, so there is nothing to install.
+      # Pinning the range documents what we actually support.
+      - name: Check the minimum supported interpreter
+        run: |
+          python - <<'PY'
+          import sys
+          if sys.version_info < (3, 9):
+              raise SystemExit(f"python 3.9+ required, found {sys.version.split()[0]}")
+          print(f"python {sys.version.split()[0]}")
+          PY
+
+      - name: Byte-compile the tooling
+        run: python -m compileall -q scripts tests
+
+      # Covers frontmatter validation, naming, links, UTF-8, the lister, the
+      # behaviour-case check, and the README/skill-list agreement.
+      - name: Run all checks
+        run: ./tests/run-tests
+
+      - name: Confirm the skill list is unchanged
+        if: github.event_name == 'pull_request'
+        run: |
+          git diff --exit-code -- README.md \
+            || { echo "::error::README.md is out of date with skills/. Run ./scripts/list-skills --markdown and update the Available skills section."; exit 1; }
